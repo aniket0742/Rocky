@@ -1,0 +1,9 @@
+.env
+ROCKY_MASTER_SPEC.md
+/bin/
+*.exe
+*.test
+*.out
+coverage.*
+node_modules/
+.DS_Store
