@@ -7,6 +7,19 @@ on:
 jobs:
   go:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: rocky
+          POSTGRES_PASSWORD: rocky
+          POSTGRES_DB: rocky
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U rocky -d rocky"
+          --health-interval 2s --health-timeout 3s --health-retries 15
+    env:
+      ROCKY_TEST_DATABASE_URL: postgres://rocky:rocky@localhost:5432/rocky?sslmode=disable
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6

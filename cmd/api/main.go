@@ -15,6 +15,7 @@ import (
 
 	"github.com/aniket0742/rocky/internal/api"
 	"github.com/aniket0742/rocky/internal/config"
+	"github.com/aniket0742/rocky/internal/storage"
 	"github.com/aniket0742/rocky/internal/telemetry"
 )
 
@@ -68,7 +69,7 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:              cfg.APIAddr,
-		Handler:           api.NewHandler(log, deps),
+		Handler:           api.NewHandler(log, storage.New(pool), deps),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	errc := make(chan error, 1)

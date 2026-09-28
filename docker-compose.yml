@@ -1,12 +1,18 @@
+x-rocky: &rocky
+  build: .
+  image: rocky:dev
+  environment: &rocky-env
+    ROCKY_DATABASE_URL: postgres://rocky:rocky@postgres:5432/rocky?sslmode=disable
+
 services:
   postgres:
-    image: postgres:17-alpine
+    image: postgres:18-alpine
     environment:
       POSTGRES_USER: rocky
       POSTGRES_PASSWORD: rocky # local dev only
       POSTGRES_DB: rocky
     ports: ["5432:5432"]
-    volumes: [pgdata:/var/lib/postgresql/data]
+    volumes: [pgdata18:/var/lib/postgresql] # PG18 layout
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U rocky -d rocky"]
       interval: 2s
@@ -22,16 +28,30 @@ services:
       timeout: 3s
       retries: 15
 
+  migrate:
+    <<: *rocky
+    entrypoint: ["migrate"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
   api:
-    build: .
+    <<: *rocky
+    entrypoint: ["api"]
     environment:
-      ROCKY_DATABASE_URL: postgres://rocky:rocky@postgres:5432/rocky?sslmode=disable
+      <<: *rocky-env
       ROCKY_REDIS_URL: redis://redis:6379/0
     ports: ["8080:8080"]
     depends_on:
-      postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
       redis: { condition: service_started } # not required for correctness (ADR 0002)
     restart: unless-stopped
 
+  worker:
+    <<: *rocky
+    entrypoint: ["worker"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    restart: unless-stopped
+
 volumes:
-  pgdata:
+  pgdata18:

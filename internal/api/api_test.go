@@ -37,7 +37,7 @@ func TestHealth(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			rec := httptest.NewRecorder()
-			NewHandler(discard, tt.deps).ServeHTTP(rec, httptest.NewRequest("GET", "/v1/health", nil))
+			NewHandler(discard, nil, tt.deps).ServeHTTP(rec, httptest.NewRequest("GET", "/v1/health", nil))
 
 			var got healthResponse
 			if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
@@ -51,7 +51,7 @@ func TestHealth(t *testing.T) {
 }
 
 func TestRequestID(t *testing.T) {
-	h := NewHandler(discard, nil)
+	h := NewHandler(discard, nil, nil)
 	for _, tc := range []struct {
 		in   string
 		keep bool

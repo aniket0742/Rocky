@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -16,6 +18,11 @@ type Config struct {
 	LogLevel        slog.Level
 	LogFormat       string // "text" or "json"
 	ShutdownTimeout time.Duration
+
+	WorkerID           string // optional: defaults to hostname plus a random suffix
+	WorkerQueues       []string
+	WorkerConcurrency  int
+	WorkerPollInterval time.Duration
 }
 
 func Load() (Config, error) { return load(os.Getenv) }
@@ -26,6 +33,7 @@ func load(getenv func(string) string) (Config, error) {
 		DatabaseURL: getenv("ROCKY_DATABASE_URL"),
 		RedisURL:    getenv("ROCKY_REDIS_URL"),
 		LogFormat:   orDefault(getenv("ROCKY_LOG_FORMAT"), "text"),
+		WorkerID:    getenv("ROCKY_WORKER_ID"),
 	}
 
 	var errs []error
@@ -41,6 +49,20 @@ func load(getenv func(string) string) (Config, error) {
 	var err error
 	if c.ShutdownTimeout, err = time.ParseDuration(orDefault(getenv("ROCKY_SHUTDOWN_TIMEOUT"), "15s")); err != nil {
 		errs = append(errs, fmt.Errorf("ROCKY_SHUTDOWN_TIMEOUT: %w", err))
+	}
+	for _, q := range strings.Split(orDefault(getenv("ROCKY_WORKER_QUEUES"), "default"), ",") {
+		if q = strings.TrimSpace(q); q != "" {
+			c.WorkerQueues = append(c.WorkerQueues, q)
+		}
+	}
+	if len(c.WorkerQueues) == 0 {
+		errs = append(errs, errors.New("ROCKY_WORKER_QUEUES must name at least one queue"))
+	}
+	if c.WorkerConcurrency, err = strconv.Atoi(orDefault(getenv("ROCKY_WORKER_CONCURRENCY"), "10")); err != nil || c.WorkerConcurrency < 1 {
+		errs = append(errs, errors.New("ROCKY_WORKER_CONCURRENCY must be a positive integer"))
+	}
+	if c.WorkerPollInterval, err = time.ParseDuration(orDefault(getenv("ROCKY_WORKER_POLL_INTERVAL"), "1s")); err != nil || c.WorkerPollInterval <= 0 {
+		errs = append(errs, errors.New("ROCKY_WORKER_POLL_INTERVAL must be a positive duration"))
 	}
 	return c, errors.Join(errs...)
 }
