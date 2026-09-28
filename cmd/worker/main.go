@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/aniket0742/rocky/internal/config"
+	"github.com/aniket0742/rocky/internal/retry"
 	"github.com/aniket0742/rocky/internal/storage"
 	"github.com/aniket0742/rocky/internal/telemetry"
 	"github.com/aniket0742/rocky/internal/worker"
@@ -47,10 +48,13 @@ func run() error {
 		id = host + "-" + strings.ToLower(rand.Text()[:6])
 	}
 	w, err := worker.New(worker.Config{
-		ID:           id,
-		Queues:       cfg.WorkerQueues,
-		Concurrency:  cfg.WorkerConcurrency,
-		PollInterval: cfg.WorkerPollInterval,
+		ID:            id,
+		Queues:        cfg.WorkerQueues,
+		Concurrency:   cfg.WorkerConcurrency,
+		PollInterval:  cfg.WorkerPollInterval,
+		LeaseTTL:      cfg.WorkerLeaseTTL,
+		ShutdownGrace: cfg.ShutdownTimeout,
+		Retry:         retry.Policy{Base: cfg.RetryBase, Max: cfg.RetryMax},
 	}, storage.New(pool), demoHandlers(), log)
 	if err != nil {
 		return err

@@ -49,6 +49,11 @@ services:
   worker:
     <<: *rocky
     entrypoint: ["worker"]
+    environment:
+      <<: *rocky-env
+      ROCKY_WORKER_LEASE_TTL: 10s # short, so crash recovery is quick to observe locally
+      ROCKY_SHUTDOWN_TIMEOUT: 10s # drain grace period
+    stop_grace_period: 30s # must exceed grace + one lease TTL, or Docker kills a draining worker
     depends_on:
       migrate: { condition: service_completed_successfully }
     restart: unless-stopped

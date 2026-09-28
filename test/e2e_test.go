@@ -31,7 +31,7 @@ func TestJobLifecycleThroughAPI(t *testing.T) {
 	reg := worker.NewRegistry()
 	reg.Register("noop", func(context.Context, []byte) error { return nil })
 	reg.Register("fail", func(context.Context, []byte) error { return errors.New("always fails") })
-	w, err := worker.New(worker.Config{ID: "e2e-worker", Queues: []string{"default"}, Concurrency: 4, PollInterval: 20 * time.Millisecond}, store, reg, log)
+	w, err := worker.New(testWorkerConfig("e2e-worker"), store, reg, log)
 	if err != nil {
 		t.Fatal(err)
 	}

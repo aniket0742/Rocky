@@ -25,7 +25,7 @@ func sleep(ctx context.Context, payload []byte) error {
 		Seconds float64 `json:"seconds"`
 	}
 	if err := json.Unmarshal(payload, &in); err != nil {
-		return fmt.Errorf("invalid payload: %w", err)
+		return worker.NonRetryable(fmt.Errorf("invalid payload: %w", err)) // retrying won't fix it
 	}
 	select {
 	case <-time.After(time.Duration(in.Seconds * float64(time.Second))):

@@ -120,7 +120,7 @@ func (s *Store) Claim(ctx context.Context, p jobs.ClaimParams) ([]jobs.Lease, er
 		rows, _ := tx.Query(ctx, `
 			UPDATE jobs j
 			SET status = 'running', attempt = j.attempt + 1, lease_token = gen_random_uuid(),
-			    lease_expires_at = now() + make_interval(secs => j.timeout_seconds) + $5::interval,
+			    lease_expires_at = now() + $5::interval,
 			    worker_id = $4, updated_at = now()
 			FROM (
 			    SELECT id FROM jobs
@@ -132,7 +132,7 @@ func (s *Store) Claim(ctx context.Context, p jobs.ClaimParams) ([]jobs.Lease, er
 			WHERE j.id = next.id
 			RETURNING j.id, j.type, j.payload, j.attempt, j.max_attempts, j.timeout_seconds,
 			          j.lease_token, j.lease_expires_at`,
-			p.Queue, p.Types, p.Limit, p.WorkerID, p.Grace)
+			p.Queue, p.Types, p.Limit, p.WorkerID, p.LeaseTTL)
 		var err error
 		leases, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (jobs.Lease, error) {
 			var l jobs.Lease
@@ -188,37 +188,90 @@ func (s *Store) Complete(ctx context.Context, jobID, token uuid.UUID) error {
 	})
 }
 
-// Fail records a failed attempt. The job moves to retrying (run_at = now + RetryIn)
-// if the failure is retryable and attempts remain, otherwise to dead_letter.
-// It returns the job's new status, or jobs.ErrLeaseLost.
+// Fail records a failed attempt reported by the lease holder. The job moves to
+// retrying (run_at = now + RetryIn) if the failure is retryable and attempts
+// remain, otherwise to dead_letter. It returns the new status, or
+// jobs.ErrLeaseLost if the token does not match or the lease has expired.
 func (s *Store) Fail(ctx context.Context, jobID, token uuid.UUID, f jobs.Failure) (jobs.Status, error) {
+	return s.failAttempt(ctx, jobID, token, f, false)
+}
+
+// Heartbeat renews the given leases for ttl and returns the IDs it renewed.
+// A lease that is missing from the result was lost (expired or superseded).
+func (s *Store) Heartbeat(ctx context.Context, leases []jobs.LeaseRef, ttl time.Duration) ([]uuid.UUID, error) {
+	ids, tokens := make([]uuid.UUID, len(leases)), make([]uuid.UUID, len(leases))
+	for i, l := range leases {
+		ids[i], tokens[i] = l.JobID, l.Token
+	}
+	rows, _ := s.pool.Query(ctx, `
+		UPDATE jobs j SET lease_expires_at = now() + $3::interval
+		FROM unnest($1::uuid[], $2::uuid[]) AS l(id, token)
+		WHERE j.id = l.id AND j.lease_token = l.token AND j.lease_expires_at > now()
+		RETURNING j.id`, ids, tokens, ttl)
+	return pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+}
+
+// ExpiredLeases returns up to limit running jobs whose lease has expired.
+func (s *Store) ExpiredLeases(ctx context.Context, limit int) ([]jobs.LeaseRef, error) {
+	rows, _ := s.pool.Query(ctx, `
+		SELECT id, lease_token, attempt FROM jobs
+		WHERE status = 'running' AND lease_expires_at <= now()
+		ORDER BY lease_expires_at
+		LIMIT $1`, limit)
+	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (jobs.LeaseRef, error) {
+		var l jobs.LeaseRef
+		return l, r.Scan(&l.JobID, &l.Token, &l.Attempt)
+	})
+}
+
+// Expire records an expired lease as a failed (retryable) attempt. It is the
+// mirror of Fail: it applies only if the lease has expired, so a worker's
+// report and the reaper can never both succeed. It returns jobs.ErrLeaseLost
+// if the lease was renewed, completed or already expired by another reaper.
+func (s *Store) Expire(ctx context.Context, l jobs.LeaseRef, retryIn time.Duration) (jobs.Status, error) {
+	return s.failAttempt(ctx, l.JobID, l.Token, jobs.Failure{Error: "lease expired", Retryable: true, RetryIn: retryIn}, true)
+}
+
+// Fenced failure transition. A reported failure needs a valid lease; an
+// expiry needs an expired one.
+const (
+	failSQL = `
+		UPDATE jobs
+		SET status      = CASE WHEN $4 AND attempt < max_attempts THEN 'retrying' ELSE 'dead_letter' END,
+		    run_at      = CASE WHEN $4 AND attempt < max_attempts THEN now() + $5::interval ELSE run_at END,
+		    finished_at = CASE WHEN $4 AND attempt < max_attempts THEN NULL ELSE now() END,
+		    last_error = $3, lease_token = NULL, lease_expires_at = NULL, updated_at = now()
+		WHERE id = $1 AND lease_token = $2 AND `
+	validLease   = `lease_expires_at > now()`
+	expiredLease = `lease_expires_at <= now()`
+	failReturn   = ` RETURNING attempt, worker_id, status, run_at`
+)
+
+func (s *Store) failAttempt(ctx context.Context, jobID, token uuid.UUID, f jobs.Failure, expired bool) (jobs.Status, error) {
+	query, outcome := failSQL+validLease+failReturn, "failed"
+	if expired {
+		query, outcome = failSQL+expiredLease+failReturn, "lease_expired"
+	}
+
 	var status jobs.Status
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		var (
-			attempt, maxAttempts int
-			worker               string
-			runAt                time.Time
+			attempt int
+			worker  string
+			runAt   time.Time
 		)
-		err := tx.QueryRow(ctx, `
-			UPDATE jobs
-			SET status      = CASE WHEN $4 AND attempt < max_attempts THEN 'retrying' ELSE 'dead_letter' END,
-			    run_at      = CASE WHEN $4 AND attempt < max_attempts THEN now() + $5::interval ELSE run_at END,
-			    finished_at = CASE WHEN $4 AND attempt < max_attempts THEN NULL ELSE now() END,
-			    last_error = $3, lease_token = NULL, lease_expires_at = NULL, updated_at = now()
-			WHERE id = $1 AND lease_token = $2 AND lease_expires_at > now()
-			RETURNING attempt, max_attempts, worker_id, status, run_at`,
-			jobID, token, f.Error, f.Retryable, f.RetryIn).Scan(&attempt, &maxAttempts, &worker, &status, &runAt)
+		err := tx.QueryRow(ctx, query, jobID, token, f.Error, f.Retryable, f.RetryIn).Scan(&attempt, &worker, &status, &runAt)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return jobs.ErrLeaseLost
 		}
 		if err != nil {
 			return err
 		}
-		if err := endAttempt(ctx, tx, jobID, attempt, "failed", &f.Error); err != nil {
+		if err := endAttempt(ctx, tx, jobID, attempt, outcome, &f.Error); err != nil {
 			return err
 		}
 		retryable := f.Retryable
-		if err := insertEvent(ctx, tx, jobID, &attempt, "failed", &worker,
+		if err := insertEvent(ctx, tx, jobID, &attempt, outcome, &worker,
 			eventData{Error: f.Error, Retryable: &retryable}); err != nil {
 			return err
 		}

@@ -14,15 +14,20 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/aniket0742/rocky/internal/jobs"
+	"github.com/aniket0742/rocky/internal/retry"
 )
 
 // fakeStore hands out pending leases and records results.
 type fakeStore struct {
-	mu        sync.Mutex
-	pending   []jobs.Lease
-	limits    []int
-	completed []uuid.UUID
-	failed    map[uuid.UUID]jobs.Failure
+	mu         sync.Mutex
+	pending    []jobs.Lease
+	limits     []int
+	completed  []uuid.UUID
+	failed     map[uuid.UUID]jobs.Failure
+	heartbeats int
+	dropLeases bool            // Heartbeat renews nothing: every lease is lost
+	expired    []jobs.LeaseRef // returned once by ExpiredLeases
+	expiredIn  map[uuid.UUID]time.Duration
 }
 
 func (f *fakeStore) Claim(_ context.Context, p jobs.ClaimParams) ([]jobs.Lease, error) {
@@ -33,6 +38,20 @@ func (f *fakeStore) Claim(_ context.Context, p jobs.ClaimParams) ([]jobs.Lease, 
 	out := f.pending[:n:n]
 	f.pending = f.pending[n:]
 	return out, nil
+}
+
+func (f *fakeStore) Heartbeat(_ context.Context, refs []jobs.LeaseRef, _ time.Duration) ([]uuid.UUID, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.heartbeats++
+	if f.dropLeases {
+		return nil, nil
+	}
+	var ids []uuid.UUID
+	for _, r := range refs {
+		ids = append(ids, r.JobID)
+	}
+	return ids, nil
 }
 
 func (f *fakeStore) Complete(_ context.Context, id, _ uuid.UUID) error {
@@ -54,21 +73,56 @@ func (f *fakeStore) Fail(_ context.Context, id, _ uuid.UUID, fl jobs.Failure) (j
 
 func (f *fakeStore) Promote(context.Context, int) (int64, error) { return 0, nil }
 
+func (f *fakeStore) ExpiredLeases(context.Context, int) ([]jobs.LeaseRef, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := f.expired
+	f.expired = nil
+	return out, nil
+}
+
+func (f *fakeStore) Expire(_ context.Context, l jobs.LeaseRef, retryIn time.Duration) (jobs.Status, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.expiredIn == nil {
+		f.expiredIn = map[uuid.UUID]time.Duration{}
+	}
+	f.expiredIn[l.JobID] = retryIn
+	return jobs.StatusRetrying, nil
+}
+
 func (f *fakeStore) reported() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.completed) + len(f.failed)
 }
 
+func (f *fakeStore) claimed() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.pending) == 0
+}
+
 func lease(typ string, payload string) jobs.Lease {
 	return jobs.Lease{JobID: uuid.New(), Type: typ, Payload: []byte(payload), Attempt: 1, TimeoutSeconds: 30, Token: uuid.New()}
 }
 
+func testConfig(concurrency int) Config {
+	return Config{
+		ID: "test", Queues: []string{"default"}, Concurrency: concurrency,
+		PollInterval: 10 * time.Millisecond, LeaseTTL: 60 * time.Millisecond, ShutdownGrace: time.Second,
+		Retry: retry.Policy{Base: time.Second, Max: time.Hour},
+	}
+}
+
 // start runs a worker in the background and returns a stop func that waits for Run to return.
 func start(t *testing.T, store Store, reg *Registry, concurrency int) (stop func()) {
+	return startWith(t, store, reg, testConfig(concurrency))
+}
+
+func startWith(t *testing.T, store Store, reg *Registry, cfg Config) (stop func()) {
 	t.Helper()
-	w, err := New(Config{ID: "test", Queues: []string{"default"}, Concurrency: concurrency, PollInterval: 10 * time.Millisecond},
-		store, reg, slog.New(slog.DiscardHandler))
+	w, err := New(cfg, store, reg, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,11 +163,30 @@ func TestReportsResults(t *testing.T) {
 	if len(store.completed) != 1 || store.completed[0] != ok.JobID || gotPayload.Load() != `{"n":1}` {
 		t.Fatalf("completed = %v, payload = %v", store.completed, gotPayload.Load())
 	}
-	if f := store.failed[boom.JobID]; f.Error != "boom" || !f.Retryable {
-		t.Fatalf("boom failure = %+v", f)
+	if f := store.failed[boom.JobID]; f.Error != "boom" || !f.Retryable || f.RetryIn < 800*time.Millisecond || f.RetryIn > 1200*time.Millisecond {
+		t.Fatalf("boom failure = %+v (want retryable, ~1s backoff)", f)
 	}
 	if f := store.failed[panics.JobID]; f.Error != "handler panicked: bad handler" {
 		t.Fatalf("panic failure = %+v", f)
+	}
+}
+
+func TestFailureClassification(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register("permanent", func(context.Context, []byte) error { return NonRetryable(errors.New("bad input")) })
+	reg.Register("transient", func(context.Context, []byte) error { return errors.New("try again") })
+	permanent, transient := lease("permanent", `{}`), lease("transient", `{}`)
+	transient.Attempt = 3 // third failure: Base·2² = 4s ±20%
+	store := &fakeStore{pending: []jobs.Lease{permanent, transient}}
+	stop := start(t, store, reg, 2)
+	eventually(t, func() bool { return store.reported() == 2 })
+	stop()
+
+	if f := store.failed[permanent.JobID]; f.Retryable || f.Error != "bad input" {
+		t.Fatalf("permanent failure = %+v", f)
+	}
+	if f := store.failed[transient.JobID]; !f.Retryable || f.RetryIn < 3200*time.Millisecond || f.RetryIn > 4800*time.Millisecond {
+		t.Fatalf("transient failure = %+v (want ~4s backoff)", f)
 	}
 }
 
@@ -162,8 +235,46 @@ func TestTimeoutFailsAttempt(t *testing.T) {
 	eventually(t, func() bool { return store.reported() == 1 })
 	stop()
 
-	if f := store.failed[l.JobID]; !strings.HasPrefix(f.Error, "timed out after 1s") {
+	if f := store.failed[l.JobID]; !strings.HasPrefix(f.Error, "timed out after 1s") || !f.Retryable {
 		t.Fatalf("failure = %+v", f)
+	}
+}
+
+func TestHeartbeatKeepsLeaseWhileRunning(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register("slow", func(context.Context, []byte) error { time.Sleep(300 * time.Millisecond); return nil })
+	store := &fakeStore{pending: []jobs.Lease{lease("slow", `{}`)}}
+	stop := start(t, store, reg, 1) // TTL 60ms: renewals every 20ms
+	eventually(t, func() bool { return store.reported() == 1 })
+	stop()
+	if len(store.completed) != 1 || store.heartbeats < 5 {
+		t.Fatalf("completed=%d heartbeats=%d", len(store.completed), store.heartbeats)
+	}
+}
+
+func TestLostLeaseCancelsHandlerAndDiscardsResult(t *testing.T) {
+	cause := make(chan error, 1)
+	reg := NewRegistry()
+	reg.Register("slow", func(ctx context.Context, _ []byte) error {
+		<-ctx.Done()
+		cause <- context.Cause(ctx)
+		return ctx.Err()
+	})
+	store := &fakeStore{pending: []jobs.Lease{lease("slow", `{}`)}, dropLeases: true}
+	stop := start(t, store, reg, 1)
+	defer stop()
+
+	select {
+	case err := <-cause:
+		if !errors.Is(err, errLeaseLost) {
+			t.Fatalf("handler cancelled with %v, want lease lost", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler was not cancelled after its lease was lost")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if store.reported() != 0 {
+		t.Fatal("a worker that lost its lease reported a result")
 	}
 }
 
@@ -172,7 +283,7 @@ func TestShutdownWaitsForInFlightJobs(t *testing.T) {
 	reg := NewRegistry()
 	reg.Register("block", func(context.Context, []byte) error { close(started); <-release; return nil })
 	store := &fakeStore{pending: []jobs.Lease{lease("block", `{}`)}}
-	stop := start(t, store, reg, 1)
+	stop := start(t, store, reg, 1) // grace 1s
 	<-started
 
 	stopped := make(chan struct{})
@@ -189,6 +300,58 @@ func TestShutdownWaitsForInFlightJobs(t *testing.T) {
 	}
 }
 
+func TestShutdownInterruptsJobsAfterGrace(t *testing.T) {
+	started := make(chan struct{})
+	reg := NewRegistry()
+	reg.Register("forever", func(ctx context.Context, _ []byte) error { close(started); <-ctx.Done(); return ctx.Err() })
+	l := lease("forever", `{}`)
+	store := &fakeStore{pending: []jobs.Lease{l}}
+	cfg := testConfig(1)
+	cfg.ShutdownGrace = 50 * time.Millisecond
+	stop := startWith(t, store, reg, cfg)
+	<-started
+	stop()
+
+	f, ok := store.failed[l.JobID]
+	if !ok || f.Error != "interrupted by worker shutdown" || !f.Retryable || f.RetryIn != 0 {
+		t.Fatalf("interrupted job failure = %+v (reported=%v); want retryable, no backoff", f, ok)
+	}
+}
+
+func TestShutdownAbandonsHandlersThatIgnoreCancellation(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	reg := NewRegistry()
+	reg.Register("stubborn", func(context.Context, []byte) error { close(started); <-release; return nil })
+	store := &fakeStore{pending: []jobs.Lease{lease("stubborn", `{}`)}}
+	cfg := testConfig(1)
+	cfg.ShutdownGrace = 50 * time.Millisecond
+	stop := startWith(t, store, reg, cfg)
+	<-started
+
+	begin := time.Now()
+	stop() // returns after grace + one lease TTL instead of waiting forever
+	if took := time.Since(begin); took > time.Second {
+		t.Fatalf("shutdown took %s", took)
+	}
+	if store.reported() != 0 {
+		t.Fatal("abandoned job should be left to lease expiry, not reported")
+	}
+}
+
+func TestReaperExpiresLeasesWithBackoff(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register("t", func(context.Context, []byte) error { return nil })
+	ref := jobs.LeaseRef{JobID: uuid.New(), Token: uuid.New(), Attempt: 2} // second failure: Base·2 = 2s ±20%
+	store := &fakeStore{expired: []jobs.LeaseRef{ref}}
+	stop := start(t, store, reg, 1)
+	eventually(t, func() bool { store.mu.Lock(); defer store.mu.Unlock(); return store.expiredIn != nil })
+	stop()
+	if d := store.expiredIn[ref.JobID]; d < 1600*time.Millisecond || d > 2400*time.Millisecond {
+		t.Fatalf("expired lease retries in %s, want ~2s", d)
+	}
+}
+
 func TestTruncateKeepsValidUTF8(t *testing.T) {
 	s := truncate(strings.Repeat("é", maxErrorLength)) // 2 bytes each: the cut lands mid-rune
 	if !utf8.ValidString(s) || len(s) > maxErrorLength+len("…") {
@@ -199,18 +362,24 @@ func TestTruncateKeepsValidUTF8(t *testing.T) {
 func TestNewValidates(t *testing.T) {
 	reg := NewRegistry()
 	reg.Register("t", func(context.Context, []byte) error { return nil })
-	good := Config{ID: "w", Queues: []string{"q"}, Concurrency: 1, PollInterval: time.Second}
-	for _, cfg := range []Config{
-		{Queues: good.Queues, Concurrency: 1, PollInterval: time.Second},
-		{ID: "w", Concurrency: 1, PollInterval: time.Second},
-		{ID: "w", Queues: good.Queues, PollInterval: time.Second},
-		{ID: "w", Queues: good.Queues, Concurrency: 1},
+	for name, mutate := range map[string]func(*Config){
+		"no id":          func(c *Config) { c.ID = "" },
+		"no queues":      func(c *Config) { c.Queues = nil },
+		"no concurrency": func(c *Config) { c.Concurrency = 0 },
+		"no poll":        func(c *Config) { c.PollInterval = 0 },
+		"no lease ttl":   func(c *Config) { c.LeaseTTL = 0 },
+		"tiny lease ttl": func(c *Config) { c.LeaseTTL = 2 },
+		"negative grace": func(c *Config) { c.ShutdownGrace = -1 },
+		"no retry base":  func(c *Config) { c.Retry.Base = 0 },
+		"max below base": func(c *Config) { c.Retry.Max = c.Retry.Base / 2 },
 	} {
+		cfg := testConfig(1)
+		mutate(&cfg)
 		if _, err := New(cfg, &fakeStore{}, reg, slog.New(slog.DiscardHandler)); err == nil {
-			t.Errorf("accepted invalid config %+v", cfg)
+			t.Errorf("%s: accepted invalid config", name)
 		}
 	}
-	if _, err := New(good, &fakeStore{}, NewRegistry(), slog.New(slog.DiscardHandler)); err == nil {
+	if _, err := New(testConfig(1), &fakeStore{}, NewRegistry(), slog.New(slog.DiscardHandler)); err == nil {
 		t.Error("accepted empty registry")
 	}
 }

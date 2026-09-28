@@ -2,7 +2,7 @@
 
 Reliable background jobs in Go. Postgres-backed job engine with fenced leases, retries, scheduling and a control plane.
 
-> **Status:** Phase 1 (core job lifecycle). Jobs can be created over HTTP and run by workers, with full history. Backoff, heartbeats and crash recovery arrive in Phase 2.
+> **Status:** Phase 2 (reliable execution). Jobs run under heartbeat-renewed leases. Crashed workers' jobs are recovered, failures retry with exponential backoff, and shutdown drains gracefully. See [ADR 0006](docs/adr/0006-lease-renewal-recovery-and-shutdown.md).
 
 ## Guarantees
 
@@ -54,7 +54,8 @@ To run binaries outside Docker, set the variables in `.env.example`, then `go ru
 | `cmd/api`, `cmd/worker`, `cmd/migrate` | Binaries |
 | `internal/jobs` | Domain: states, records, enqueue rules |
 | `internal/storage` | Postgres: every state transition and its SQL |
-| `internal/worker` | Handler registry, claim loop, execution |
+| `internal/worker` | Handler registry, claim loop, heartbeats, reaper, shutdown |
+| `internal/retry` | Backoff policy |
 | `internal/api` | HTTP handlers, middleware, error shape |
 | `migrations` | SQL schema (embedded) |
 | `test` | End-to-end tests |

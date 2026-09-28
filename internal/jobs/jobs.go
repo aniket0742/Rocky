@@ -85,15 +85,23 @@ type Lease struct {
 	ExpiresAt      time.Time
 }
 
+// LeaseRef identifies one lease: the job, the fencing token and its attempt.
+type LeaseRef struct {
+	JobID   uuid.UUID
+	Token   uuid.UUID
+	Attempt int
+}
+
+// Ref returns the lease's identity for heartbeats and results.
+func (l Lease) Ref() LeaseRef { return LeaseRef{JobID: l.JobID, Token: l.Token, Attempt: l.Attempt} }
+
 // ClaimParams selects what a worker may claim.
 type ClaimParams struct {
 	Queue    string
 	Types    []string // only jobs this worker has handlers for
 	Limit    int
 	WorkerID string
-	// Grace is added to the job's timeout to form the lease duration.
-	// Phase 2 replaces this with a short TTL renewed by heartbeats.
-	Grace time.Duration
+	LeaseTTL time.Duration // renewed by heartbeats while the job runs
 }
 
 // Failure describes a failed attempt.

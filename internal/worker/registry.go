@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -9,9 +10,20 @@ import (
 	"github.com/aniket0742/rocky/internal/jobs"
 )
 
-// Handler executes one job. Returning nil completes the job; an error fails the attempt.
-// ctx carries the job's timeout, and handlers must respect it.
+// Handler executes one job. Returning nil completes the job; an error fails the
+// attempt and is retried with backoff unless wrapped with NonRetryable.
+// ctx is cancelled on timeout, lease loss or shutdown; handlers must respect it.
 type Handler func(ctx context.Context, payload []byte) error
+
+// NonRetryable marks err as permanent: the job dead-letters instead of retrying.
+func NonRetryable(err error) error { return nonRetryable{err} }
+
+type nonRetryable struct{ err error }
+
+func (e nonRetryable) Error() string { return e.err.Error() }
+func (e nonRetryable) Unwrap() error { return e.err }
+
+func isNonRetryable(err error) bool { return errors.As(err, new(nonRetryable)) }
 
 // Registry maps job types to handlers.
 type Registry struct {

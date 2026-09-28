@@ -20,7 +20,8 @@ func TestLoadDefaults(t *testing.T) {
 	if c.APIAddr != ":8080" || c.LogFormat != "text" || c.LogLevel != slog.LevelInfo || c.ShutdownTimeout != 15*time.Second {
 		t.Fatalf("unexpected defaults: %+v", c)
 	}
-	if !slices.Equal(c.WorkerQueues, []string{"default"}) || c.WorkerConcurrency != 10 || c.WorkerPollInterval != time.Second {
+	if !slices.Equal(c.WorkerQueues, []string{"default"}) || c.WorkerConcurrency != 10 || c.WorkerPollInterval != time.Second ||
+		c.WorkerLeaseTTL != 30*time.Second || c.RetryBase != 2*time.Second || c.RetryMax != time.Hour {
 		t.Fatalf("unexpected worker defaults: %+v", c)
 	}
 	if c.RedisURL != "" {
@@ -36,12 +37,15 @@ func TestLoadReportsAllErrors(t *testing.T) {
 		"ROCKY_WORKER_QUEUES":        " , ",
 		"ROCKY_WORKER_CONCURRENCY":   "0",
 		"ROCKY_WORKER_POLL_INTERVAL": "-1s",
+		"ROCKY_WORKER_LEASE_TTL":     "0s",
+		"ROCKY_RETRY_BASE":           "10m",
+		"ROCKY_RETRY_MAX":            "1m",
 	}))
 	if err == nil {
 		t.Fatal("expected error")
 	}
 	for _, want := range []string{"ROCKY_DATABASE_URL", "ROCKY_LOG_FORMAT", "ROCKY_LOG_LEVEL", "ROCKY_SHUTDOWN_TIMEOUT",
-		"ROCKY_WORKER_QUEUES", "ROCKY_WORKER_CONCURRENCY", "ROCKY_WORKER_POLL_INTERVAL"} {
+		"ROCKY_WORKER_QUEUES", "ROCKY_WORKER_CONCURRENCY", "ROCKY_WORKER_POLL_INTERVAL", "ROCKY_WORKER_LEASE_TTL", "ROCKY_RETRY_MAX"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error missing %s: %v", want, err)
 		}

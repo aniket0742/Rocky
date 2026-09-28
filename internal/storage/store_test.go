@@ -43,7 +43,7 @@ func enqueue(t *testing.T, s *storage.Store, p jobs.EnqueueParams) jobs.Job {
 func claim(t *testing.T, s *storage.Store, worker string, limit int) []jobs.Lease {
 	t.Helper()
 	leases, err := s.Claim(ctx, jobs.ClaimParams{
-		Queue: "default", Types: []string{"echo"}, Limit: limit, WorkerID: worker, Grace: 30 * time.Second,
+		Queue: "default", Types: []string{"echo"}, Limit: limit, WorkerID: worker, LeaseTTL: 30 * time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -163,7 +163,7 @@ func TestConcurrentClaimsAreExclusive(t *testing.T) {
 		wg.Go(func() {
 			for {
 				leases, err := s.Claim(ctx, jobs.ClaimParams{
-					Queue: "default", Types: []string{"echo"}, Limit: 3, WorkerID: fmt.Sprint("worker-", w), Grace: time.Minute,
+					Queue: "default", Types: []string{"echo"}, Limit: 3, WorkerID: fmt.Sprint("worker-", w), LeaseTTL: time.Minute,
 				})
 				if err != nil {
 					t.Error(err)
@@ -296,7 +296,7 @@ func TestStrictLeaseExpiry(t *testing.T) {
 	if _, err := s.Fail(ctx, j.ID, l.Token, jobs.Failure{Error: "x", Retryable: true}); !errors.Is(err, jobs.ErrLeaseLost) {
 		t.Fatalf("fail after expiry: err = %v, want ErrLeaseLost", err)
 	}
-	wantStatus(t, s, j.ID, jobs.StatusRunning) // the Phase 2 reaper turns this into a failed attempt
+	wantStatus(t, s, j.ID, jobs.StatusRunning) // until the reaper expires it (TestExpireRecoversLease)
 }
 
 func TestRetryWaitsForBackoff(t *testing.T) {
@@ -362,6 +362,119 @@ func TestNonRetryableFailure(t *testing.T) {
 	events, _ := s.Events(ctx, j.ID)
 	if last := string(events[len(events)-1].Data); last != `{"reason": "non_retryable"}` {
 		t.Fatalf("dead_lettered data = %s", last)
+	}
+}
+
+func expireNow(t *testing.T, pool *pgxpool.Pool, id uuid.UUID) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `UPDATE jobs SET lease_expires_at = now() - interval '1 millisecond' WHERE id = $1`, id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHeartbeatRenewsOnlyValidLeases(t *testing.T) {
+	s, pool := setup(t)
+	for range 3 {
+		enqueue(t, s, jobs.EnqueueParams{})
+	}
+	leases := claim(t, s, "w", 3)
+	valid, expired, wrongToken := leases[0], leases[1], leases[2]
+	expireNow(t, pool, expired.JobID)
+	wrongToken.Token = uuid.New()
+
+	before := get(t, s, valid.JobID).LeaseExpiresAt
+	renewed, err := s.Heartbeat(ctx, []jobs.LeaseRef{valid.Ref(), expired.Ref(), wrongToken.Ref()}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(renewed) != 1 || renewed[0] != valid.JobID {
+		t.Fatalf("renewed %v, want only %s", renewed, valid.JobID)
+	}
+	if after := get(t, s, valid.JobID).LeaseExpiresAt; !after.After(before.Add(50 * time.Minute)) {
+		t.Fatalf("lease not extended: %s -> %s", before, after)
+	}
+	if got := eventTypes(t, s, valid.JobID); len(got) != 2 {
+		t.Fatalf("heartbeats must not write events: %v", got)
+	}
+}
+
+// An expired lease becomes a failed attempt with backoff; the stale holder stays fenced out.
+func TestExpireRecoversLease(t *testing.T) {
+	s, pool := setup(t)
+	j := enqueue(t, s, jobs.EnqueueParams{})
+	l := claimOne(t, s, "crashed-worker")
+
+	if refs, _ := s.ExpiredLeases(ctx, 10); len(refs) != 0 {
+		t.Fatal("a live lease was reported as expired")
+	}
+	if _, err := s.Expire(ctx, l.Ref(), 0); !errors.Is(err, jobs.ErrLeaseLost) {
+		t.Fatalf("expiring a live lease: err = %v, want ErrLeaseLost", err)
+	}
+
+	expireNow(t, pool, j.ID)
+	refs, err := s.ExpiredLeases(ctx, 10)
+	if err != nil || len(refs) != 1 || refs[0] != l.Ref() {
+		t.Fatalf("expired leases = %v, err = %v", refs, err)
+	}
+	status, err := s.Expire(ctx, refs[0], time.Minute)
+	if err != nil || status != jobs.StatusRetrying {
+		t.Fatalf("status=%s err=%v", status, err)
+	}
+	job := wantStatus(t, s, j.ID, jobs.StatusRetrying)
+	if d := time.Until(job.RunAt); d < 50*time.Second || *job.LastError != "lease expired" {
+		t.Fatalf("retry in %s, last_error %q", d, *job.LastError)
+	}
+	if _, err := s.Expire(ctx, refs[0], 0); !errors.Is(err, jobs.ErrLeaseLost) {
+		t.Fatal("the same lease was expired twice")
+	}
+	if err := s.Complete(ctx, j.ID, l.Token); !errors.Is(err, jobs.ErrLeaseLost) {
+		t.Fatal("crashed worker completed a job after its lease was recovered")
+	}
+
+	events, _ := s.Events(ctx, j.ID)
+	if got := eventTypes(t, s, j.ID); !slices.Equal(got, []string{"enqueued", "claimed", "lease_expired", "retry_scheduled"}) {
+		t.Fatalf("events = %v", got)
+	}
+	if *events[2].WorkerID != "crashed-worker" {
+		t.Fatalf("lease_expired should name the worker that lost it: %+v", events[2])
+	}
+	if attempts, _ := s.Attempts(ctx, j.ID); attempts[0].Status != "lease_expired" {
+		t.Fatalf("attempt status = %s", attempts[0].Status)
+	}
+}
+
+// A job that keeps crashing its worker still reaches dead-letter.
+func TestExpireOnLastAttemptDeadLetters(t *testing.T) {
+	s, pool := setup(t)
+	j := enqueue(t, s, jobs.EnqueueParams{MaxAttempts: 1})
+	l := claimOne(t, s, "w")
+	expireNow(t, pool, j.ID)
+	if status, err := s.Expire(ctx, l.Ref(), time.Minute); err != nil || status != jobs.StatusDeadLetter {
+		t.Fatalf("status=%s err=%v", status, err)
+	}
+	events, _ := s.Events(ctx, j.ID)
+	if last := events[len(events)-1]; last.Type != "dead_lettered" || string(last.Data) != `{"reason": "attempts_exhausted"}` {
+		t.Fatalf("last event = %s %s", last.Type, last.Data)
+	}
+}
+
+// Around expiry, the holder's report and the reaper race; exactly one may win.
+func TestReportAndReaperAreMutuallyExclusive(t *testing.T) {
+	s, pool := setup(t)
+	for i := range 20 {
+		enqueue(t, s, jobs.EnqueueParams{})
+		l := claimOne(t, s, "w")
+		if i%2 == 0 {
+			expireNow(t, pool, l.JobID)
+		}
+		var wg sync.WaitGroup
+		var completeErr, expireErr error
+		wg.Go(func() { completeErr = s.Complete(ctx, l.JobID, l.Token) })
+		wg.Go(func() { _, expireErr = s.Expire(ctx, l.Ref(), 0) })
+		wg.Wait()
+		if (completeErr == nil) == (expireErr == nil) {
+			t.Fatalf("round %d: complete err=%v, expire err=%v; want exactly one success", i, completeErr, expireErr)
+		}
 	}
 }
 

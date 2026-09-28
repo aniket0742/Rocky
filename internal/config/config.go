@@ -23,6 +23,10 @@ type Config struct {
 	WorkerQueues       []string
 	WorkerConcurrency  int
 	WorkerPollInterval time.Duration
+	WorkerLeaseTTL     time.Duration
+
+	RetryBase time.Duration // delay after the first failed attempt; doubles each attempt
+	RetryMax  time.Duration
 }
 
 func Load() (Config, error) { return load(os.Getenv) }
@@ -63,6 +67,22 @@ func load(getenv func(string) string) (Config, error) {
 	}
 	if c.WorkerPollInterval, err = time.ParseDuration(orDefault(getenv("ROCKY_WORKER_POLL_INTERVAL"), "1s")); err != nil || c.WorkerPollInterval <= 0 {
 		errs = append(errs, errors.New("ROCKY_WORKER_POLL_INTERVAL must be a positive duration"))
+	}
+	for _, d := range []struct {
+		name string
+		dst  *time.Duration
+		def  string
+	}{
+		{"ROCKY_WORKER_LEASE_TTL", &c.WorkerLeaseTTL, "30s"},
+		{"ROCKY_RETRY_BASE", &c.RetryBase, "2s"},
+		{"ROCKY_RETRY_MAX", &c.RetryMax, "1h"},
+	} {
+		if *d.dst, err = time.ParseDuration(orDefault(getenv(d.name), d.def)); err != nil || *d.dst <= 0 {
+			errs = append(errs, fmt.Errorf("%s must be a positive duration", d.name))
+		}
+	}
+	if c.RetryMax < c.RetryBase {
+		errs = append(errs, errors.New("ROCKY_RETRY_MAX must be at least ROCKY_RETRY_BASE"))
 	}
 	return c, errors.Join(errs...)
 }
